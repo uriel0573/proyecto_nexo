@@ -1,0 +1,174 @@
+import json
+import math
+import os
+import rclpy
+from geometry_msgs.msg import PoseStamped
+from rclpy.duration import Duration
+from rclpy.node import Node
+from std_msgs.msg import String
+from tf2_ros import Buffer, TransformException, TransformListener
+
+
+class LocationManagerNode(Node):
+
+    def __init__(self):
+        super().__init__('location_manager_node')
+
+        self.filepath = os.path.expanduser(
+            '~/shared/nexo_ws/src/nexo_mentorpi/config/locations.json'
+        )
+        self.locations = self.load_locations()
+
+        # Buffer y Listener de TF2
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # Suscriptores
+        self.create_subscription(
+            String, '/nexo/save_location', self.save_location_cb, 10
+        )
+        self.create_subscription(
+            String, '/nexo/get_location', self.get_location_cb, 10
+        )
+
+        # Publicadores
+        self.pose_pub = self.create_publisher(
+            PoseStamped, '/nexo/current_pose', 10
+        )
+        self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
+        self.arrival_pub = self.create_publisher(
+            String, '/nexo/events/arrival', 10
+        )
+
+        self.last_reported_station = None
+
+        # Timer a 1 Hz
+        self.create_timer(1.0, self.publish_current_pose)
+
+        self.get_logger().info(
+            f'LocationManager listo. Puntos guardados en: {self.filepath}'
+        )
+
+    def load_locations(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                self.get_logger().error(f'Error al cargar locations.json: {e}')
+        return {}
+
+    def save_locations_to_file(self):
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        with open(self.filepath, 'w') as f:
+            json.dump(self.locations, f, indent=4)
+
+    def get_current_tf(self):
+        try:
+            # Time(seconds=0) pide el ultimo frame disponible y timeout da 0.1s de tolerancia
+            t = self.tf_buffer.lookup_transform(
+                'map',
+                'base_footprint',
+                rclpy.time.Time(seconds=0),
+                timeout=Duration(seconds=0.1),
+            )
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            q = t.transform.rotation
+
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            yaw_deg = round(math.degrees(math.atan2(siny_cosp, cosy_cosp)), 2)
+
+            return round(x, 3), round(y, 3), yaw_deg, q
+        except Exception as ex:
+            self.get_logger().warn(
+                f'Esperando TF map -> base_footprint... ({ex})',
+                throttle_duration_sec=3.0,
+            )
+            return None, None, None, None
+        
+    def publish_current_pose(self):
+        x, y, yaw, q = self.get_current_tf()
+        if x is not None:
+            pose_msg = PoseStamped()
+            pose_msg.header.frame_id = 'map'
+            pose_msg.header.stamp = self.get_clock().now().to_msg()
+            pose_msg.pose.position.x = x
+            pose_msg.pose.position.y = y
+            pose_msg.pose.orientation = q
+
+            self.pose_pub.publish(pose_msg)
+            self.get_logger().info(
+                f'Pose publicada -> X: {x}, Y: {y}, Yaw: {yaw} deg'
+            )
+            self.check_station_arrival(x, y)
+
+    def check_station_arrival(self, x, y):
+        tolerance = 0.25
+        current_station = None
+
+        for name, coords in self.locations.items():
+            dist = math.hypot(x - coords['x'], y - coords['y'])
+            if dist <= tolerance:
+                current_station = name
+                break
+
+        if current_station and current_station != self.last_reported_station:
+            self.last_reported_station = current_station
+            msg = String()
+            msg.data = current_station
+            self.arrival_pub.publish(msg)
+            self.get_logger().info(
+                f'Llegada detectada a la estacion: {current_station}'
+            )
+        elif not current_station:
+            self.last_reported_station = None
+
+    def save_location_cb(self, msg: String):
+        location_name = msg.data.strip()
+        x, y, yaw, _ = self.get_current_tf()
+        if x is None:
+            self.get_logger().error(
+                'No se pudo guardar: TF no disponible actualmente.'
+            )
+            return
+        self.locations[location_name] = {'x': x, 'y': y, 'yaw_deg': yaw}
+        self.save_locations_to_file()
+        self.get_logger().info(
+            f'Ubicacion "{location_name}" guardada con exito.'
+        )
+
+    def get_location_cb(self, msg: String):
+        location_name = msg.data.strip()
+        if location_name not in self.locations:
+            self.get_logger().warn(
+                f'Ubicacion "{location_name}" no encontrada.'
+            )
+            return
+        loc = self.locations[location_name]
+        goal_msg = PoseStamped()
+        goal_msg.header.frame_id = 'map'
+        goal_msg.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.position.x = loc['x']
+        goal_msg.pose.position.y = loc['y']
+        half_yaw = math.radians(loc['yaw_deg']) * 0.5
+        goal_msg.pose.orientation.z = math.sin(half_yaw)
+        goal_msg.pose.orientation.w = math.cos(half_yaw)
+        self.goal_pub.publish(goal_msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LocationManagerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
