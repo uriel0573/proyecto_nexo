@@ -1,85 +1,82 @@
-# Location Manager Node (`nexo_mentorpi`)
+# Módulo de Localización, Cinemática y Gestión de Estaciones (`location_manager.py`)
 
-Este paquete contiene la implementación del nodo **Location Manager** para el robot **MentorPi A1** en ROS 2 Humble. Este nodo gestiona la localización en tiempo real del robot respecto al mapa global, la persistencia de puntos de interés (estaciones) en formato JSON y el envío de objetivos de navegación.
-
-## Descripción del Nodo
-
-El nodo `location_manager_node` realiza las siguientes funciones clave:
-
-* **Consulta de TF2 (Localización Global):** Lee la transformación entre las tramas `map` y `base_footprint` a una frecuencia de **1 Hz** para obtener las coordenadas actuales ($x, y$) y la orientación ($\text{Yaw}$ en grados).
-* **Publicación de Pose Actual:** Emite la ubicación del robot de forma continua en el tópico `/nexo/current_pose` (`geometry_msgs/msg/PoseStamped`).
-* **Gestión de Puntos y Estaciones (JSON):**
-  * **Guardado:** Al recibir un nombre en `/nexo/save_location`, almacena las coordenadas actuales en `~/shared/nexo_ws/src/nexo_mentorpi/config/locations.json`.
-  * **Despacho de Metas:** Al recibir el nombre de una estación en `/nexo/get_location`, publica la meta correspondiente en `/goal_pose` para que Nav2 inicie la navegación.
-* **Detección de Llegada:** Compara continuamente la distancia entre el robot y las estaciones guardadas. Si el robot se encuentra dentro de un radio de tolerancia de **0.25 metros**, publica el nombre de la estación en `/nexo/events/arrival`.
+Nodo de **ROS 2 Humble** (`location_manager_node`) encargado de consultar en tiempo real la pose global del robot **MentorPi A1** en el mapa mediante TF2 (`map -> base_footprint`), calcular su velocidad lineal y distancia recorrida acumulada, y gestionar el guardado y detección de arribo a estaciones de trabajo en `config/locations.json`.
 
 ---
 
-## Instrucciones de Ejecución
+## Características Principales
 
-Sigue el orden estricto de las pestañas/terminales para asegurar que los transformadores TF2 y la odometría láser estén disponibles antes de iniciar el nodo de localización.
-
-### Pestaña 1: Sistema de Navegación Nav2
-
-Inicia el mapa y la localización de AMCL:
-
-```zsh
-source /opt/ros/humble/setup.zsh
-source /home/ubuntu/ros2_ws/install/setup.zsh
-export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
-ros2 launch navigation navigation.launch.py map:=map_equipoX
-```
-*(Reemplaza `map_equipoX` por el nombre de tu mapa guardado).*
+* **Localización Global por TF2:** Consulta cada `1.0 s` (`1 Hz`) la transformada `map -> base_footprint` y convierte la orientación de cuaternión a ángulo `yaw` en grados sexagesimales.
+* **Cálculo Cinemático (Velocidad y Distancia):** Integra los desplazamientos euclidianos entre lecturas sucesivas para publicar la velocidad lineal instantánea (`m/s`) y la distancia total recorrida (`m`).
+* **Filtro de Ruido y Saltos de Relocalización:** Implementa una banda de desplazamiento válido (`0.02 m <= step <= 1.5 m`):
+  * Descarta micro-variaciones menores a `2 cm` (`min_step = 0.02 m`) generadas por el ruido de la odometría láser (`rf2o`) cuando el robot está detenido[cite: 1].
+  * Ignora saltos mayores a `1.5 m` en un solo segundo para evitar que una reubicación manual en Foxglove (*Publish 2D pose estimate*) sume distancia falsa.
+* **Detección Automática de Arribo:** Compara la posición actual contra las coordenadas registradas en `locations.json` y publica un evento en `/nexo/events/arrival` cuando el robot entra en un radio de `0.25 m` de una estación.
 
 ---
 
-### Pestaña 2: Corrección de Escaneo LiDAR (`scan_fixer`)
+## Interfaz ROS 2
 
-Ajusta la lectura del sensor láser para evitar discrepancias de filtrado:
+### Tópicos Suscritos
+| Tópico | Tipo de Mensaje | Descripción |
+| :--- | :--- | :--- |
+| `/nexo/save_location` | `std_msgs/msg/String` | Guarda las coordenadas actuales $(x, y, \text{yaw})$ en `locations.json` bajo el nombre enviado. |
+| `/nexo/get_location` | `std_msgs/msg/String` | Busca una estación por nombre en `locations.json` y publica su pose hacia `/goal_pose`. |
+| `/nexo/telemetry/reset_distance` | `std_msgs/msg/String` | Reinicia el contador de distancia recorrida acumulada a `0.0 m`. |
 
-```zsh
-source /opt/ros/humble/setup.zsh
-export ROS_DOMAIN_ID=0
-cd ~/shared && python3 scan_fixer.py
-```
+### Tópicos Publicados (1 Hz y Eventos)
+| Tópico | Tipo de Mensaje | Descripción |
+| :--- | :--- | :--- |
+| `/nexo/current_pose` | `geometry_msgs/msg/PoseStamped` | Pose actual del robot en el marco `map`. |
+| `/nexo/telemetry/speed` | `std_msgs/msg/Float32` | Velocidad lineal instantánea del robot (`m/s`). |
+| `/nexo/telemetry/distance` | `std_msgs/msg/Float32` | Distancia recorrida acumulada (`m`). |
+| `/nexo/events/arrival` | `std_msgs/msg/String` | Nombre de la estación alcanzada al entrar en su radio de tolerancia (`0.25 m`). |
+| `/goal_pose` | `geometry_msgs/msg/PoseStamped` | Meta de navegación enviada cuando se solicita una estación vía `/nexo/get_location`. |
+
+### Parámetros Configurables
+* `min_step` (default: `0.02`): Desplazamiento mínimo en metros para contabilizar movimiento y velocidad[cite: 1].
 
 ---
 
-### Pestaña 3: Odometría Láser (`rf2o`)
+## Comandos de Compilación y Ejecución
 
-Publica la odometría requerida por el árbol de transformaciones TF:
+### 1. Requisitos previos activos
+Para que exista la transformada `map -> base_footprint`, deben estar corriendo Nav2 (`navigation.launch.py`), `scan_fixer.py` y `rf2o_scan_fixed.launch.py`, con el robot localizado en el mapa[cite: 1].
 
-```zsh
-source /opt/ros/humble/setup.zsh
-export ROS_DOMAIN_ID=0
-ros2 launch ~/shared/rf2o_scan_fixed.launch.py
-```
-
----
-
-### Pestaña 4: Nodo Location Manager
-
-Compila (si realizaste cambios) y ejecuta el nodo de localización:
-
+### 2. Compilar el paquete
 ```zsh
 source /opt/ros/humble/setup.zsh
 cd ~/shared/nexo_ws
+colcon build --packages-select nexo_mentorpi
 source install/setup.zsh
+export ROS_DOMAIN_ID=0
+```
+
+### 3. Ejecutar el nodo `location_manager`
+```zsh
+source /opt/ros/humble/setup.zsh
+source ~/shared/nexo_ws/install/setup.zsh
 export ROS_DOMAIN_ID=0
 ros2 run nexo_mentorpi location_manager
 ```
 
----
-
-## Interacción con el Nodo por Tópicos
-
-* **Guardar la posición actual como estación (ejemplo: "estacion_A"):**
+### 4. Comandos útiles de prueba y telemetría
+* **Consultar pose, velocidad y distancia en tiempo real:**
   ```zsh
-  ros2 topic pub --once /nexo/save_location std_msgs/msg/String "{data: 'estacion_A'}"
+  source /opt/ros/humble/setup.zsh
+  export ROS_DOMAIN_ID=0
+  ros2 topic echo /nexo/current_pose --once
+  ros2 topic echo /nexo/telemetry/speed --once
+  ros2 topic echo /nexo/telemetry/distance --once
   ```
-
-* **Mandar al robot hacia la estación guardada:**
+* **Reiniciar la distancia recorrida acumulada a `0.0 m`:**
   ```zsh
-  ros2 topic pub --once /nexo/get_location std_msgs/msg/String "{data: 'estacion_A'}"
+  source /opt/ros/humble/setup.zsh
+  export ROS_DOMAIN_ID=0
+  ros2 topic pub --once /nexo/telemetry/reset_distance std_msgs/msg/String "{data: 'reset'}"
   ```
+* **Guardar la posición actual del robot como una estación:**
+  ```zsh
+  source /opt/ros/humble/setup.zsh
+  export ROS_DOMAIN_ID=0
+  ros2 topic pub --once /nexo/save_location std_msgs/msg/String "{data: 'Est_Prueba'}"
