@@ -1,56 +1,71 @@
-# Battery Manager Node (`nexo_mentorpi`)
+# Módulo de Gestión de Batería y Autonomía (`battery_manager.py`)
 
-Este repositorio contiene la implementación del nodo de gestión de batería real para el robot **MentorPi A1** (basado en tarjeta controladora STM32 / Yahboom) desarrollado en ROS 2 Humble.
-
-## Descripción del Nodo
-
-El nodo `battery_manager_node` se encarga de monitorear y procesar la telemetría eléctrica del robot en tiempo real para tomar decisiones de autonomía:
-
-* **Suscripción de Hardware:** Escucha la telemetría del controlador base en el tópico `/ros_robot_controller/battery` (mensajes `std_msgs/msg/UInt16` en milivoltios).
-* **Calibración y Filtro de Suavizado (EMA):** Aplica un filtro digital de promedio móvil exponencial (*Exponential Moving Average*) sobre el voltaje. Esto elimina las caídas repentinas de tensión (*voltage sag*) producidas por la demanda de corriente de los motores al acelerar o frenar.
-* **Escala de Carga:** Mapea el rango operativo real de la batería LiPo ($7.0\text{V} = 0\%$ a $8.4\text{V} = 100\%$) a una escala porcentual continua ($0.0\%$ - $100.0\%$).
-* **Publicación de Estados:** Envía el porcentaje calculado a `/nexo/battery/percentage` y el estado del sistema a `/nexo/battery/status` según los siguientes umbrales:
-  * **`OK`**: Porcentaje superior al 30%.
-  * **`LOW_BATTERY_RETURN`**: Porcentaje entre 20% y 30%.
-  * **`CRITICAL_CHARGE_NOW`**: Porcentaje menor o igual al 20% (continúa reportando el porcentaje real de descarga continua sin forzar lecturas a 0).
+Nodo de **ROS 2 Humble** (`battery_manager_node`) encargado de monitorear en tiempo real el voltaje real de la batería LiPo del robot **MentorPi A1**, suavizar la señal ante picos de corriente de los motores, evaluar alertas operativas y estimar los minutos de autonomía restantes según la velocidad de desplazamiento.
 
 ---
 
-## Instrucciones de Uso
+## Características Principales
 
-### Prerrequisitos
-Asegúrate de tener corriendo el driver del hardware en una terminal principal antes de ejecutar este nodo:
+* **Lectura y Filtrado de Voltaje (EMA):** Se suscribe al voltaje crudo en milivolts (`/ros_robot_controller/battery`) y aplica un Filtro Promedio Móvil Exponencial ($\alpha = 0.15$) para evitar falsas caídas de porcentaje durante aceleraciones bruscas.
+* **Conversión Lineal a Porcentaje:** Mapea el rango operativo de la batería (`7.0 V` = `0.0 %` hasta `8.4 V` = `100.0 %`).
+* **Estimación Dinámica de Autonomía:** Calcula los minutos restantes combinando una tasa de descarga base en reposo (`1.67 %/min`, equivalente a ~60 min al 100 %) con un incremento proporcional a la velocidad lineal del robot (`15.0 %/min` por cada `m/s` recorrido), suscribiéndose a `/nexo/telemetry/speed`.
+* **Evaluación de Estados Críticos:** Clasifica el estado energético en `OK`, `LOW_BATTERY_RETURN` ($\le 30.0\%$) y `CRITICAL_CHARGE_NOW` ($\le 20.0\%$) para habilitar bloqueos preventivos en el navegador.
 
+---
+
+## Interfaz ROS 2
+
+### Tópicos Suscritos
+| Tópico | Tipo de Mensaje | Descripción |
+| :--- | :--- | :--- |
+| `/ros_robot_controller/battery` | `std_msgs/msg/UInt16` | Lectura cruda del voltaje de batería en milivolts (`mV`). |
+| `/nexo/telemetry/speed` | `std_msgs/msg/Float32` | Velocidad lineal instantánea del robot (`m/s`) publicada por `location_manager`. |
+
+### Tópicos Publicados (1 Hz)
+| Tópico | Tipo de Mensaje | Descripción |
+| :--- | :--- | :--- |
+| `/nexo/battery/percentage` | `std_msgs/msg/Float32` | Nivel de carga filtrado (`0.0` a `100.0 %`). |
+| `/nexo/battery/voltage` | `std_msgs/msg/Float32` | Voltaje suavizado en Volts (`V`). |
+| `/nexo/battery/autonomy_min` | `std_msgs/msg/Float32` | Tiempo estimado de autonomía restante en minutos (`min`). |
+| `/nexo/battery/status` | `std_msgs/msg/String` | Estado operativo (`OK`, `LOW_BATTERY_RETURN`, `CRITICAL_CHARGE_NOW`). |
+
+### Parámetros Configurables
+* `min_operating_battery` (default: `30.0`): Umbral de batería baja (%).
+* `critical_battery` (default: `20.0`): Umbral de batería crítica (%).
+* `base_discharge_rate` (default: `1.67`): Tasa base de descarga en reposo (`%/min`).
+* `motion_discharge_gain` (default: `15.0`): Factor de descarga adicional por velocidad (`%/min` por `m/s`).
+* `v_empty` (default: `7.0`): Voltaje correspondiente al `0 %`.
+* `v_full` (default: `8.4`): Voltaje correspondiente al `100 %`.
+
+---
+
+## Comandos de Compilación y Ejecución
+
+### 1. Compilar el paquete
 ```zsh
 source /opt/ros/humble/setup.zsh
-source /home/ubuntu/ros2_ws/install/setup.zsh
+cd ~/shared/nexo_ws
+colcon build --packages-select nexo_mentorpi
+source install/setup.zsh
 export ROS_DOMAIN_ID=0
-export ROS_LOCALHOST_ONLY=0
-ros2 launch bringup bringup.launch.py
 ```
 
----
-
-### Compilación y Ejecución del Nodo
-
-Abre una nueva terminal y sigue estos comandos para ingresar al workspace, compilar y ejecutar el nodo:
-
+### 2. Ejecutar el nodo `battery_manager`
 ```zsh
-# 1. Cargar el entorno de ROS 2 Humble
 source /opt/ros/humble/setup.zsh
-
-# 2. Navegar al workspace de desarrollo
-cd ~/shared/nexo_ws
-
-# 3. Compilar el paquete nexo_mentorpi
-colcon build --packages-select nexo_mentorpi
-
-# 4. Cargar el entorno del workspace compilado
-source install/setup.zsh
-
-# 5. Configurar el ID de dominio común para ROS 2
+source ~/shared/nexo_ws/install/setup.zsh
 export ROS_DOMAIN_ID=0
-
-# 6. Ejecutar el nodo de gestión de batería
 ros2 run nexo_mentorpi battery_manager
 ```
+
+### 3. Verificar los tópicos publicados en otra terminal
+```zsh
+source /opt/ros/humble/setup.zsh
+export ROS_DOMAIN_ID=0
+ros2 topic echo /nexo/battery/percentage --once
+ros2 topic echo /nexo/battery/voltage --once
+ros2 topic echo /nexo/battery/autonomy_min --once
+ros2 topic echo /nexo/battery/status --once
+```
+
+---
