@@ -1,0 +1,228 @@
+## Código Fuente (`smac_navigator.py`)
+
+```python
+#!/usr/bin/env python3
+import math
+import rclpy
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float32, String
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+
+# Topicos publicados por /battery_manager_node
+TOPICO_PORCENTAJE = '/nexo/battery/percentage'
+TOPICO_ESTADO = '/nexo/battery/status'
+
+ESTACIONES = {
+    '1': ('Est C1',   3.53,  3.93, 0.0),
+    '2': ('Est C2',   0.39, -0.03, 0.0),
+    '3': ('Est C3',   8.04, -0.41, 0.0),
+    '4': ('Alm 1',    0.22,  2.87, 0.0),
+    '5': ('Alm 2',    3.62,  0.37, 0.0),
+    '6': ('Alm 3',    9.19,  1.03, 0.0),
+    '7': ('AGV Pool', 0.00,  0.00, 0.0),
+    '8': ('Inicio',   0.18,  4.28, 0.0),
+}
+
+ESTACIONES_CARGA = {'1', '2', '3'}
+ESTACION_DEFAULT = '7'     # AGV Pool (0.0, 0.0)
+K_PCT_PER_M = 4.0          # % de bateria consumido por metro recorrido
+RESERVA_PCT = 20.0         # Margen minimo de seguridad
+
+
+def crear_pose(navigator, x, y, yaw=0.0):
+    pose = PoseStamped()
+    pose.header.frame_id = 'map'
+    pose.header.stamp = navigator.get_clock().now().to_msg()
+    pose.pose.position.x = float(x)
+    pose.pose.position.y = float(y)
+    pose.pose.orientation.z = math.sin(yaw / 2.0)
+    pose.pose.orientation.w = math.cos(yaw / 2.0)
+    return pose
+
+
+def longitud_ruta(path):
+    if path is None or len(path.poses) < 2:
+        return None
+    total = 0.0
+    for a, b in zip(path.poses[:-1], path.poses[1:]):
+        total += math.hypot(
+            b.pose.position.x - a.pose.position.x,
+            b.pose.position.y - a.pose.position.y
+        )
+    return total
+
+
+def buscar_cargadores_alcanzables(navigator, pct_actual):
+    """Evalua a que estaciones de carga llega el robot desde su posicion actual."""
+    alcanzables = []
+    for key in sorted(ESTACIONES_CARGA):
+        nombre, x, y, yaw = ESTACIONES[key]
+        pose_c = crear_pose(navigator, x, y, yaw)
+        path = navigator.getPath(PoseStamped(), pose_c, use_start=False)
+        dist = longitud_ruta(path)
+        if dist is not None:
+            req = K_PCT_PER_M * dist + RESERVA_PCT
+            if pct_actual is None or pct_actual >= req:
+                alcanzables.append((key, nombre, dist, req))
+    alcanzables.sort(key=lambda item: item[2])
+    return alcanzables
+
+
+def main():
+    rclpy.init()
+    navigator = BasicNavigator(node_name='smac_navigator')
+
+    # Datos recibidos desde /battery_manager_node
+    bateria = {'pct': None, 'status': 'DESCONOCIDO'}
+
+    def cb_pct(msg):
+        bateria['pct'] = msg.data
+
+    def cb_status(msg):
+        bateria['status'] = msg.data
+
+    navigator.create_subscription(Float32, TOPICO_PORCENTAJE, cb_pct, 10)
+    navigator.create_subscription(String, TOPICO_ESTADO, cb_status, 10)
+
+    navigator.initial_pose_received = True
+    print('Esperando a que Nav2 y AMCL esten activos...')
+    navigator.waitUntilNav2Active(localizer='amcl')
+    print('Nav2 listo para navegar!')
+
+    try:
+        while rclpy.ok():
+            rclpy.spin_once(navigator, timeout_sec=0.2)
+            pct = bateria['pct']
+            status = bateria['status']
+
+            if pct is not None:
+                info_bat = f'{pct:.1f}% | Estado: {status}'
+            else:
+                info_bat = 'Sin lectura (ejecuta battery_manager)'
+
+            print('\n' + '=' * 56)
+            print('  MENU DE ESTACIONES DEL ALMACEN')
+            print(f'  Bateria: {info_bat}')
+            print('=' * 56)
+            for key, (nombre, x, y, _) in ESTACIONES.items():
+                tipo = ' [CARGA]' if key in ESTACIONES_CARGA else ''
+                print(f'  [{key}] {nombre:<10}{tipo:<8} -> (x={x:>6.2f}, y={y:>6.2f})')
+            print('  [q] Salir')
+            print('=' * 56)
+
+            opcion = input('Selecciona el numero de estacion destino: ').strip().lower()
+
+            if opcion == 'q':
+                print('Saliendo del navegador...')
+                break
+
+            if opcion not in ESTACIONES:
+                print('Opcion no valida. Intenta de nuevo.')
+                continue
+
+            rclpy.spin_once(navigator, timeout_sec=0.1)
+            pct = bateria['pct']
+            status = bateria['status']
+
+            estados_bajos = ('CRITICAL', 'LOW', 'CRITICO', 'BAJA', 'CRITICAL_CHARGE_NOW', 'LOW_BATTERY_RETURN')
+            if status.upper() in estados_bajos and opcion not in ESTACIONES_CARGA:
+                print(f'\n[BLOQUEADO] battery_manager reporta estado [{status}] ({pct:.1f}%).')
+                alcanzables = buscar_cargadores_alcanzables(navigator, pct)
+                if alcanzables:
+                    mejor_key, mejor_nom, _, _ = alcanzables[0]
+                    print('Estaciones de carga alcanzables:')
+                    for k, nom, d, r in alcanzables:
+                        print(f'  -> [{k}] {nom} (Dist: {d:.2f} m | Req: {r:.1f}%)')
+                    resp = input(f'Enviar al cargador mas cercano [{mejor_key}] {mejor_nom}? [s/n]: ').strip().lower()
+                    if resp == 's':
+                        opcion = mejor_key
+                    else:
+                        continue
+                else:
+                    print('[PELIGRO] No alcanza bateria ni para la estacion de carga mas cercana.')
+                    continue
+
+            nombre, x, y, yaw = ESTACIONES[opcion]
+            goal_pose = crear_pose(navigator, x, y, yaw)
+
+            # 1. Calcular longitud de ruta de ida
+            path_ida = navigator.getPath(PoseStamped(), goal_pose, use_start=False)
+            l_ida = longitud_ruta(path_ida)
+
+            if l_ida is None:
+                print(f'\n[ERROR] Nav2 no encontro ruta valida hacia [{nombre}]. Revisa obstaculos o costmap.')
+                continue
+
+            # 2. Si el destino es una estacion de carga, solo evalua la ida
+            if opcion in ESTACIONES_CARGA:
+                energia_necesaria = K_PCT_PER_M * l_ida + RESERVA_PCT
+                print(f'\nAnalisis de ruta a CARGA -> Ida: {l_ida:.2f} m')
+                print(f'Energia requerida para llegar (con {RESERVA_PCT:.0f}% reserva): {energia_necesaria:.1f}%')
+            else:
+                # Si es estacion de trabajo o AGV Pool, evalua ida + regreso al cargador mas cercano
+                mejor_regreso = None
+                cargador_retorno = ESTACIONES[ESTACION_DEFAULT][0]
+                for key_c in ESTACIONES_CARGA:
+                    nom_c, cx, cy, cyaw = ESTACIONES[key_c]
+                    pose_c = crear_pose(navigator, cx, cy, cyaw)
+                    path_reg = navigator.getPath(goal_pose, pose_c, use_start=True)
+                    d_reg = longitud_ruta(path_reg)
+                    if d_reg is not None and (mejor_regreso is None or d_reg < mejor_regreso):
+                        mejor_regreso = d_reg
+                        cargador_retorno = nom_c
+
+                l_regreso = mejor_regreso or 0.0
+                energia_necesaria = K_PCT_PER_M * (l_ida + l_regreso) + RESERVA_PCT
+                print(f'\nAnalisis de ruta -> Ida: {l_ida:.2f} m | Regreso a carga ({cargador_retorno}): {l_regreso:.2f} m')
+                print(f'Energia requerida (con {RESERVA_PCT:.0f}% reserva): {energia_necesaria:.1f}%')
+
+            # 3. Validar si el porcentaje actual alcanza
+            if pct is not None and pct < energia_necesaria:
+                print(f'[ALERTA] ENERGIA INSUFICIENTE para [{nombre}] (Bateria: {pct:.1f}% < {energia_necesaria:.1f}%).')
+                alcanzables = buscar_cargadores_alcanzables(navigator, pct)
+                if alcanzables:
+                    print('Estaciones de carga a las que SI llegas con tu bateria actual:')
+                    for k, nom, d, r in alcanzables:
+                        print(f'  [{k}] {nom:<10} -> Distancia: {d:.2f} m | Energia necesaria: {r:.1f}%')
+                    mejor_key, mejor_nom, _, _ = alcanzables[0]
+                    resp = input(f'Redirigir a la mas cercana ([{mejor_key}] {mejor_nom})? [s/n]: ').strip().lower()
+                    if resp == 's':
+                        nombre, x, y, yaw = ESTACIONES[mejor_key]
+                        goal_pose = crear_pose(navigator, x, y, yaw)
+                    else:
+                        print('Viaje cancelado por seguridad energetica.')
+                        continue
+                else:
+                    print('[CRITICO] No tienes bateria suficiente para llegar a ninguna estacion de carga.')
+                    continue
+
+            print(f'Enviando robot hacia [{nombre}] en ({x}, {y})...')
+            navigator.goToPose(goal_pose)
+
+            while not navigator.isTaskComplete():
+                feedback = navigator.getFeedback()
+                if feedback:
+                    print(f'Distancia restante a {nombre}: {feedback.distance_remaining:.2f} m', end='\r')
+                rclpy.spin_once(navigator, timeout_sec=0.1)
+
+            result = navigator.getResult()
+            print()
+            if result == TaskResult.SUCCEEDED:
+                print(f'[OK] Llegada exitosa a {nombre}!')
+            elif result == TaskResult.CANCELED:
+                print(f'[AVISO] Navegacion hacia {nombre} cancelada.')
+            elif result == TaskResult.FAILED:
+                print(f'[ERROR] No se pudo alcanzar {nombre}.')
+
+    except KeyboardInterrupt:
+        print('\nInterrupcion detectada. Cancelando tarea actual...')
+        navigator.cancelTask()
+    finally:
+        navigator.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
