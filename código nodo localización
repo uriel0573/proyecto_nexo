@@ -1,3 +1,11 @@
+```
+
+---
+
+## Código Fuente (`location_manager.py`)
+
+```python
+#!/usr/bin/env python3
 import json
 import math
 import os
@@ -5,8 +13,8 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
-from std_msgs.msg import String
-from tf2_ros import Buffer, TransformException, TransformListener
+from std_msgs.msg import Float32, String
+from tf2_ros import Buffer, TransformListener
 
 
 class LocationManagerNode(Node):
@@ -19,6 +27,10 @@ class LocationManagerNode(Node):
         )
         self.locations = self.load_locations()
 
+        # Parametro de umbral minimo de movimiento (min_step = 0.02 m)
+        self.declare_parameter('min_step', 0.02)
+        self.min_step = self.get_parameter('min_step').value
+
         # Buffer y Listener de TF2
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -30,6 +42,9 @@ class LocationManagerNode(Node):
         self.create_subscription(
             String, '/nexo/get_location', self.get_location_cb, 10
         )
+        self.create_subscription(
+            String, '/nexo/telemetry/reset_distance', self.reset_distance_cb, 10
+        )
 
         # Publicadores
         self.pose_pub = self.create_publisher(
@@ -39,14 +54,27 @@ class LocationManagerNode(Node):
         self.arrival_pub = self.create_publisher(
             String, '/nexo/events/arrival', 10
         )
+        self.speed_pub = self.create_publisher(
+            Float32, '/nexo/telemetry/speed', 10
+        )
+        self.distance_pub = self.create_publisher(
+            Float32, '/nexo/telemetry/distance', 10
+        )
 
         self.last_reported_station = None
+
+        # Variables para velocidad y distancia recorrida
+        self.prev_x = None
+        self.prev_y = None
+        self.prev_time = None
+        self.total_distance = 0.0
+        self.current_speed = 0.0
 
         # Timer a 1 Hz
         self.create_timer(1.0, self.publish_current_pose)
 
         self.get_logger().info(
-            f'LocationManager listo. Puntos guardados en: {self.filepath}'
+            f'LocationManager listo (Pose, Velocidad y Distancia | min_step={self.min_step} m).'
         )
 
     def load_locations(self):
@@ -63,9 +91,12 @@ class LocationManagerNode(Node):
         with open(self.filepath, 'w') as f:
             json.dump(self.locations, f, indent=4)
 
+    def reset_distance_cb(self, msg: String):
+        self.total_distance = 0.0
+        self.get_logger().info('Distancia recorrida reiniciada a 0.0 m.')
+
     def get_current_tf(self):
         try:
-            # Time(seconds=0) pide el ultimo frame disponible y timeout da 0.1s de tolerancia
             t = self.tf_buffer.lookup_transform(
                 'map',
                 'base_footprint',
@@ -87,10 +118,39 @@ class LocationManagerNode(Node):
                 throttle_duration_sec=3.0,
             )
             return None, None, None, None
-        
+
+    def update_kinematics(self, x, y):
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+
+        if self.prev_x is not None and self.prev_y is not None and self.prev_time is not None:
+            dt = now_sec - self.prev_time
+            step_dist = math.hypot(x - self.prev_x, y - self.prev_y)
+
+            # Ignorar ruido (< 0.02 m) cuando el robot esta detenido
+            # y saltar teletransportaciones (> 1.5 m) al re-localizar con 2D Pose Estimate
+            if self.min_step <= step_dist <= 1.5 and dt > 0.05:
+                self.total_distance += step_dist
+                self.current_speed = step_dist / dt
+            else:
+                self.current_speed = 0.0
+
+        self.prev_x = x
+        self.prev_y = y
+        self.prev_time = now_sec
+
+        speed_msg = Float32()
+        speed_msg.data = float(round(self.current_speed, 3))
+        self.speed_pub.publish(speed_msg)
+
+        dist_msg = Float32()
+        dist_msg.data = float(round(self.total_distance, 3))
+        self.distance_pub.publish(dist_msg)
+
     def publish_current_pose(self):
         x, y, yaw, q = self.get_current_tf()
         if x is not None:
+            self.update_kinematics(x, y)
+
             pose_msg = PoseStamped()
             pose_msg.header.frame_id = 'map'
             pose_msg.header.stamp = self.get_clock().now().to_msg()
@@ -100,7 +160,8 @@ class LocationManagerNode(Node):
 
             self.pose_pub.publish(pose_msg)
             self.get_logger().info(
-                f'Pose publicada -> X: {x}, Y: {y}, Yaw: {yaw} deg'
+                f'Pose -> X: {x}, Y: {y}, Yaw: {yaw} deg | '
+                f'Vel: {self.current_speed:.2f} m/s | Dist: {self.total_distance:.2f} m'
             )
             self.check_station_arrival(x, y)
 
@@ -172,3 +233,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+```
