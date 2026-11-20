@@ -1,0 +1,42 @@
+## Parte 1: Stack Base de Navegación y Visualización (5 Pestañas)
+
+Abre 5 pestañas independientes en la terminal y ejecuta un bloque por pestaña en orden:
+
+### Pestaña 1 — Nav2 con el mapa editado (`map_equipo3_alamcen_ed`)
+```zsh
+source /opt/ros/humble/setup.zsh
+source /home/ubuntu/ros2_ws/install/setup.zsh
+export ROS_DOMAIN_ID=0
+ros2 launch navigation navigation.launch.py map:=map_equipo3_alamcen_ed
+```
+
+### Pestaña 2 — Corrector de escaneo LiDAR (`scan_fixer.py`)
+```zsh
+source /opt/ros/humble/setup.zsh
+export ROS_DOMAIN_ID=0
+cd ~/shared && python3 scan_fixer.py
+```
+
+### Pestaña 3 — Odometría láser (`rf2o`)
+```zsh
+source /opt/ros/humble/setup.zsh
+source /home/ubuntu/ros2_ws/install/setup.zsh
+export ROS_DOMAIN_ID=0
+ros2 launch ~/shared/rf2o_scan_fixed.launch.py
+```
+
+### Pestaña 4 — Puente WebSocket para Foxglove (`rosbridge`)
+```zsh
+source /opt/ros/humble/setup.zsh
+export ROS_DOMAIN_ID=0
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+```
+
+### Pestaña 5 — Visualización de trayectoria (`path_relay.py`)
+```zsh
+source /opt/ros/humble/setup.zsh
+export ROS_DOMAIN_ID=0
+cd ~/shared && python3 path_relay.py
+```
+
+---
