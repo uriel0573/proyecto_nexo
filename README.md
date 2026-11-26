@@ -117,7 +117,7 @@ Cada pestaña empieza con `nexo`.
 ### 0. Preparar
 ```bash
 nexo
-stop_ros
+~/.stop_ros.sh
 echo $ROS_DOMAIN_ID       # debe ser 3
 ```
 
